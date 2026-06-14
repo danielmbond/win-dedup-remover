@@ -1,6 +1,6 @@
 # Windows Data Deduplication Decommissioning Tool
 
-A robust, enterprise-grade PowerShell automation script designed to safely reverse, decommission, and completely uninstall the Windows Data Deduplication (`FS-Data-Deduplication`) feature from a targeted storage volume.
+PowerShell script designed to clean up D:\System Volume Information\Dedup and uninstall the Windows Data Deduplication (`FS-Data-Deduplication`) feature from a targeted storage volume.
 
 Expanding deduplicated data back to its original footprint is a high-risk operational task. If structural queues jam or a volume runs out of space, it can result in catastrophic data data corruption or frozen volumes. This script mitigates those risks by introducing a rigid, multi-step safety pipeline that handles pre-cleanup, diagnostic health monitoring, storage boundary calculations, and post-removal reporting.
 
