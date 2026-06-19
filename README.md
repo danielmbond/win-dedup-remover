@@ -1,6 +1,7 @@
 # win-dedup-remover.ps1
 
 ## Purpose
+:\System Volume Information\Dedup is huge.
 `win-dedup-remover.ps1` runs a controlled Data Deduplication removal workflow for a target volume.
 
 It is designed to:
