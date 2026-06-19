@@ -69,8 +69,7 @@ Unoptimization completion is determined by `Get-DedupStatus`:
 From an elevated PowerShell session:
 
 ```powershell
-Set-Location "C:\Users\jmfmuch\source\repos\EUP\PowerShell\Disk"
-.\Unoptimize.ps1
+.\win-dedup-remover.ps1
 ```
 
 ## Output
