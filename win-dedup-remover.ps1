@@ -1,13 +1,40 @@
+<#
+.SYNOPSIS
+    Fully unoptimizes (rehydrates) a Data Deduplication volume and reclaims its dedup store.
+
+.DESCRIPTION
+    Resets the Deduplication service, then runs a controlled dedup workflow on a target
+    volume:
+        1. Enable dedup (Backup usage) and run an initial Garbage Collection.
+        2. Disable dedup, then loop Unoptimization + Garbage Collection until
+           unoptimization is 100% complete (no optimized files remain).
+        3. Run a final full Garbage Collection and stop any remaining dedup jobs.
+    Progress is logged to the console and optionally to a log file. A final storage
+    footprint report is produced and scheduled dedup tasks are re-enabled.
+
+.NOTES
+    Requires: Data Deduplication feature (Deduplication PowerShell module), administrator rights.
+    Run from an elevated PowerShell 7+ session.
+
+.EXAMPLE
+    .\Unoptimize.ps1
+    Runs the full unoptimization workflow against the configured target drive.
+#>
+
+#Requires -Version 7.0
+#Requires -RunAsAdministrator
+
 # ==============================================================================
 # CONFIGURATION CONSTANTS & CONTROLS
 # ==============================================================================
-$TARGET_DRIVE     = "D"              # Target drive letter (Do not include a colon)
-$LOOP_INTERVAL    = 300              # Loop wait time in seconds (Default: 5 minutes)
+$TARGET_DRIVE  = "D"                          # Target drive letter (do NOT include a colon)
+$LOOP_INTERVAL = 300                          # Status poll interval in seconds (default: 5 minutes)
+$MIN_FREE_SPACE_GB = 500                      # Stop unoptimization if free space drops below this threshold
+$LOW_SPACE_COOLDOWN_SECONDS = 300             # Cooldown only when unoptimization stops for low free space
 
-# Safety & Logging Features
-$ENABLE_LOGGING   = $true            # Set to $true to output to a file, $false to skip
-$LOG_FILE_PATH    = "C:\DedupRemovalLog.txt" # Log file destination path
-$FORCE_UNOPT      = $false           # Set to $true to bypass the 50% free space warning
+# Logging features
+$ENABLE_LOGGING = $true                       # $true to write to a log file, $false to skip
+$LOG_FILE_PATH  = "C:\DedupRemovalLog.txt"    # Log file destination path
 
 # Derived variables
 $DriveVolume   = "$($TARGET_DRIVE):"
@@ -21,9 +48,10 @@ function Write-LogMessage {
     param (
         [Parameter(Mandatory = $true)]
         [string]$Message,
-        
+
         [string]$Color = "White"
     )
+
     Write-Host $Message -ForegroundColor $Color
 
     if ($ENABLE_LOGGING) {
@@ -32,20 +60,49 @@ function Write-LogMessage {
     }
 }
 
+function Get-BracketedDateTime {
+    <#
+    .SYNOPSIS
+        Returns the current date and time enclosed in square brackets.
+    .DESCRIPTION
+        By default, returns local time in the format [YYYY-MM-DD HH:MM:SS].
+        Use -Utc switch to return UTC time instead.
+    .PARAMETER Utc
+        If specified, returns the date/time in UTC.
+    .EXAMPLE
+        Get-BracketedDateTime
+        Output: [2026-06-15 14:45:12]
+    .EXAMPLE
+        Get-BracketedDateTime -Utc
+        Output: [2026-06-15 12:45:12]
+    #>
+    param (
+        [switch]$Utc
+    )
+
+    try {
+        $now = if ($Utc) { Get-Date -AsUTC } else { Get-Date }
+        return "[{0}]" -f ($now.ToString("yyyy-MM-dd HH:mm:ss"))
+    }
+    catch {
+        Write-Error "Failed to generate bracketed date/time: $_"
+    }
+}
+
 function Get-DiskAndDedupStatus {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
         [string]$Prefix,
-        
+
         [Parameter(Mandatory = $true)]
         [string]$DriveId
     )
 
-    $diskFree = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$DriveId'" | 
-        Select-Object DeviceID, 
-            @{Name="FreeSpace(TB)"; Expression={[math]::Round($_.FreeSpace / 1TB, 2)}}
-    
+    $diskFree = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$DriveId'" |
+        Select-Object DeviceID,
+            @{ Name = "FreeSpace(TB)"; Expression = { [math]::Round($_.FreeSpace / 1TB, 2) } }
+
     $progress = Get-DedupJob | Select-Object -ExpandProperty Progress -ErrorAction SilentlyContinue
     if ($null -eq $progress) { $progress = "No active job" }
 
@@ -57,19 +114,92 @@ function Watch-DedupJob {
     param (
         [Parameter(Mandatory = $true)]
         [string]$JobPrefix,
-        
+
         [Parameter(Mandatory = $true)]
         [string]$Volume,
-        
+
         [Parameter(Mandatory = $true)]
         [string]$DriveId,
-        
+
         [int]$IntervalSeconds = 300
     )
+
     while (Get-DedupJob -Volume $Volume -ErrorAction SilentlyContinue) {
-        Get-DiskAndDedupStatus -Prefix $JobPrefix -DriveId $DriveId
+        $dt = Get-BracketedDateTime
+        Get-DiskAndDedupStatus -Prefix "$dt | $JobPrefix" -DriveId $DriveId
         Start-Sleep -Seconds $IntervalSeconds
     }
+}
+
+function Get-FreeSpaceGB {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$DriveId
+    )
+
+    $diskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$DriveId'"
+    if ($null -eq $diskInfo) {
+        throw "Unable to read disk info for $DriveId"
+    }
+
+    return [math]::Round($diskInfo.FreeSpace / 1GB, 2)
+}
+
+function Watch-UnoptimizationWithFreeSpaceGuard {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$JobPrefix,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Volume,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DriveId,
+
+        [Parameter(Mandatory = $true)]
+        [double]$MinimumFreeSpaceGB,
+
+        [int]$IntervalSeconds = 300
+    )
+
+    $stoppedForLowSpace = $false
+
+    while (Get-DedupJob -Volume $Volume -ErrorAction SilentlyContinue) {
+        $currentFreeGB = Get-FreeSpaceGB -DriveId $DriveId
+        $dt = Get-BracketedDateTime
+        Get-DiskAndDedupStatus -Prefix "$dt | $JobPrefix | Free: $currentFreeGB GB" -DriveId $DriveId
+
+        if ($currentFreeGB -lt $MinimumFreeSpaceGB) {
+            Write-LogMessage -Message "Free space dropped below threshold ($currentFreeGB GB < $MinimumFreeSpaceGB GB). Stopping unoptimization job." -Color Red
+            Stop-DedupJob -Volume $Volume -ErrorAction SilentlyContinue
+            $stoppedForLowSpace = $true
+            break
+        }
+
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+
+    return $stoppedForLowSpace
+}
+
+function Get-UnoptimizationComplete {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Volume
+    )
+
+    # Unoptimization is considered 100% complete when no optimized files
+    # remain on the volume (nothing left to expand).
+    $status = Get-DedupStatus -Volume $Volume -ErrorAction SilentlyContinue
+    if ($null -eq $status) {
+        # No dedup status reported -> nothing optimized on the volume.
+        return $true
+    }
+
+    $optimizedFiles = [int64]($status.OptimizedFilesCount)
+    Write-LogMessage -Message "Dedup status for ${Volume}: OptimizedFilesCount = $optimizedFiles, SavedSpace = $([math]::Round($status.SavedSpace / 1GB, 2)) GB" -Color Gray
+
+    return ($optimizedFiles -le 0)
 }
 
 # ==============================================================================
@@ -96,86 +226,67 @@ Start-Sleep -Seconds 5
 Start-Service -Name ddpsvc
 
 # ==============================================================================
-# 3. PRE-CLEANUP QUEUE PURGE (SCRUBBING & INITIAL GC)
+# 3. DEDUP UNOPTIMIZATION WORKFLOW
 # ==============================================================================
 
-Write-LogMessage -Message "Step 3: Running a high-priority structural integrity Scrubbing job on $DriveVolume..." -Color Yellow
-Start-DedupJob -Volume $DriveVolume -Type Scrubbing -Priority High
+Write-LogMessage -Message "Step 3: Enabling dedup volume on $DriveVolume using Backup usage type..." -Color Yellow
+Enable-DedupVolume -Volume $DriveVolume -UsageType Backup
 
-Write-LogMessage -Message "Allowing scrubbing job to initialize, then stopping it to flush queue..." -Color Gray
-Start-Sleep -Seconds 60
-Stop-DedupJob -Volume $DriveVolume -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 5
-
-Write-LogMessage -Message "Step 4: Launching standard Garbage Collection to clear easily reclaimable blocks..." -Color Yellow
-Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Priority High
+Write-LogMessage -Message "Step 4: Running initial high-priority Garbage Collection (memory cap 75)..." -Color Yellow
+Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Priority High -Memory 75
 Watch-DedupJob -JobPrefix "GarbageCollection" -Volume $DriveVolume -DriveId $LogicalDiskId -IntervalSeconds $LOOP_INTERVAL
 
-# ==============================================================================
-# 4. DIAGNOSTIC PERFORMANCE CHECKS & SAFETY CHECKS
-# ==============================================================================
+Write-LogMessage -Message "Sleeping 5 minutes..." -Color Gray
+Start-Sleep -Seconds 300
 
-Write-LogMessage -Message "`n--- Current Queue & Disk Health State ---" -Color Magenta
-if ($ENABLE_LOGGING) { Get-DedupJob | Out-String | Out-File -FilePath $LOG_FILE_PATH -Append }
-Get-DedupJob
-
-$DiskNum = (Get-Partition -DriveLetter $TARGET_DRIVE).DiskNumber
-$reliability = Get-Disk | Where-Object Number -eq $DiskNum | Get-StorageReliabilityCounter | Select-Object ReadErrorsTotal, WriteErrorsTotal
-if ($ENABLE_LOGGING) { $reliability | Out-String | Out-File -FilePath $LOG_FILE_PATH -Append }
-$reliability
-
-Get-Counter -Counter "\LogicalDisk($LogicalDiskId)\Disk Reads/sec", "\LogicalDisk($LogicalDiskId)\Disk Writes/sec" -MaxSamples 2
-Write-LogMessage -Message "----------------------------------------`n" -Color Magenta
-
-$totalSpace = $initialDiskInfo.Size
-$freeSpace  = $initialDiskInfo.FreeSpace
-
-if ($null -ne $totalSpace -and $totalSpace -gt 0) {
-    $freePercent = ($freeSpace / $totalSpace) * 100
-    Write-LogMessage -Message "Drive $LogicalDiskId calculations: Total Space: $([math]::Round($totalSpace/1TB,2)) TB, Free Space: $([math]::Round($freeSpace/1TB,2)) TB ($([math]::Round($freePercent,2))% free)" -Color Gray
-    
-    if ($freePercent -lt 50) {
-        Write-LogMessage -Message "⚠️ WARNING: Drive $LogicalDiskId has less than 50% free space ($([math]::Round($freePercent,2))% free)." -Color Red
-        Write-LogMessage -Message "Expanding deduplicated files back to full size might consume all remaining storage!" -Color Red
-        
-        if ($FORCE_UNOPT) {
-            Write-LogMessage -Message "Bypassing warning because `$FORCE_UNOPT is set to `$true." -Color DarkYellow
-        } else {
-            Write-LogMessage -Message "Prompting user for manual verification..." -Color Yellow
-            $confirmation = Read-Host "Do you want to proceed with unoptimization anyway? (Type 'YES' to continue)"
-            if ($confirmation -ne "YES") {
-                Write-LogMessage -Message "❌ Execution aborted by user due to low free space thresholds." -Color Red
-				Get-ScheduledTask -TaskPath "\Microsoft\Windows\Deduplication\" | Enable-ScheduledTask
-				Disable-DedupVolume -Volume $DriveVolume
-                Exit
-            }
-            Write-LogMessage -Message "User explicitly authorized unoptimization via console confirmation." -Color DarkYellow
-        }
-    }
-}
-
-# ==============================================================================
-# 5. UNOPTIMIZATION & DE-PROVISIONING
-# ==============================================================================
-
-Write-LogMessage -Message "Step 5: Starting full Unoptimization on $DriveVolume (Expanding files)..." -Color Yellow
-Start-DedupJob -Volume $DriveVolume -Type Unoptimization
-Watch-DedupJob -JobPrefix "Unoptimization" -Volume $DriveVolume -DriveId $LogicalDiskId -IntervalSeconds $LOOP_INTERVAL
-Write-LogMessage -Message "Unoptimization complete." -Color Green
-
-Write-LogMessage -Message "Step 6: Running deep final Garbage Collection..." -Color Yellow
-Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Full
-Watch-DedupJob -JobPrefix "GarbageCollection -Full" -Volume $DriveVolume -DriveId $LogicalDiskId -IntervalSeconds $LOOP_INTERVAL
-Write-LogMessage -Message "Deep Garbage Collection complete." -Color Green
-
-Write-LogMessage -Message "Step 7: Disabling deduplication engine for volume $DriveVolume..." -Color Yellow
+Write-LogMessage -Message "Step 5: Disabling dedup on $DriveVolume before unoptimization loop..." -Color Yellow
 Disable-DedupVolume -Volume $DriveVolume
 
-Write-LogMessage -Message "Step 8: Completely uninstalling Data Deduplication server role..." -Color Red
-Uninstall-WindowsFeature -Name FS-Data-Deduplication -Remove
+Write-LogMessage -Message "Sleeping 5 minutes..." -Color Gray
+Start-Sleep -Seconds 300
+
+Write-LogMessage -Message "Step 6: Looping Unoptimization + Garbage Collection until unoptimization reaches 100%..." -Color Yellow
+$unoptPass = 0
+do {
+    $unoptPass++
+
+    Write-LogMessage -Message "Pass $unoptPass - Starting Unoptimization run..." -Color Yellow
+    Disable-DedupVolume -Volume $DriveVolume
+    Start-Sleep -Seconds 60
+    Start-DedupJob -Volume $DriveVolume -Type Unoptimization -Preempt
+    $stoppedForLowSpace = Watch-UnoptimizationWithFreeSpaceGuard -JobPrefix "Unoptimization (Pass $unoptPass)" -Volume $DriveVolume -DriveId $LogicalDiskId -MinimumFreeSpaceGB $MIN_FREE_SPACE_GB -IntervalSeconds $LOOP_INTERVAL
+
+    if ($stoppedForLowSpace) {
+        Write-LogMessage -Message "Pass $unoptPass - Unoptimization was paused because free space is below $MIN_FREE_SPACE_GB GB." -Color Yellow
+        Write-LogMessage -Message "Pass $unoptPass - Cooling down for $LOW_SPACE_COOLDOWN_SECONDS seconds before Garbage Collection..." -Color Gray
+        Start-Sleep -Seconds $LOW_SPACE_COOLDOWN_SECONDS
+    }
+
+    Write-LogMessage -Message "Pass $unoptPass - Running Garbage Collection..." -Color Yellow
+    Enable-DedupVolume -Volume $DriveVolume -UsageType Backup
+    Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Priority High -Memory 75
+    Watch-DedupJob -JobPrefix "GarbageCollection (Pass $unoptPass)" -Volume $DriveVolume -DriveId $LogicalDiskId -IntervalSeconds $LOOP_INTERVAL
+
+    $isComplete = Get-UnoptimizationComplete -Volume $DriveVolume
+    if ($isComplete) {
+        Write-LogMessage -Message "Unoptimization reached 100% (no optimized files remain) after $unoptPass pass(es)." -Color Green
+    }
+    else {
+        Write-LogMessage -Message "Unoptimization not yet complete. Starting another Unoptimization + GC pass..." -Color Yellow
+    }
+} while (-not $isComplete)
+
+Write-LogMessage -Message "Step 7: Running final full Garbage Collection..." -Color Yellow
+Enable-DedupVolume -Volume $DriveVolume -UsageType Backup
+Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Full -Priority High -Memory 75
+Watch-DedupJob -JobPrefix "GarbageCollection (Full Final)" -Volume $DriveVolume -DriveId $LogicalDiskId -IntervalSeconds $LOOP_INTERVAL
+
+Write-LogMessage -Message "Step 8: Stopping any remaining dedup job handles..." -Color Yellow
+Stop-DedupJob -Volume $DriveVolume -ErrorAction SilentlyContinue
+Disable-DedupVolume -Volume $DriveVolume
 
 # ==============================================================================
-# 6. FINAL STORAGE FOOTPRINT REPORT
+# 4. FINAL STORAGE FOOTPRINT REPORT
 # ==============================================================================
 
 $finalDiskInfo = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$LogicalDiskId'"
@@ -195,23 +306,22 @@ Write-LogMessage -Message "--------------------------------------------------" -
 
 if ($spaceDifference -ge 0) {
     Write-LogMessage -Message "Storage Reclaimed: $spaceDifference TB" -Color Green
-} else {
+}
+else {
     $absDiff = [math]::Abs($spaceDifference)
     Write-LogMessage -Message "Storage Footprint Increased By: $absDiff TB (Expected due to unoptimization expansion)" -Color Yellow
 }
 Write-LogMessage -Message "==================================================`n" -Color Green
 
 # ==============================================================================
-# 7. SERVER REBOOT SCHEDULE
+# 5. WRAP-UP
 # ==============================================================================
 
-Write-LogMessage -Message "Step 9: Process finished. Server will restart in 5 minutes. Save your work." -Color Red
-Start-Sleep -Seconds 300
-Restart-Computer -Force
-
-
+Write-LogMessage -Message "Process finished. Re-enabling scheduled deduplication tasks." -Color Green
+Get-ScheduledTask -TaskPath "\Microsoft\Windows\Deduplication\" | Enable-ScheduledTask
 
 <#
+# Useful diagnostics:
 Get-DedupStatus -Volume "D:" | Select-Object -Property *
 Get-ChildItem -Path "D:\System Volume Information\Dedup\State" -Recurse -Force | Measure-Object -Property Length -Sum
 Get-Counter -ListSet *Dedup* | Select-Object CounterSetName, Paths
