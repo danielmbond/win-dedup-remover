@@ -318,7 +318,7 @@ Write-LogMessage -Message "==================================================`n"
 # ==============================================================================
 
 Write-LogMessage -Message "Process finished. Re-enabling scheduled deduplication tasks." -Color Green
-Get-ScheduledTask -TaskPath "\Microsoft\Windows\Deduplication\" | Enable-ScheduledTask
+# Get-ScheduledTask -TaskPath "\Microsoft\Windows\Deduplication\" | Enable-ScheduledTask
 
 <#
 # Useful diagnostics:
