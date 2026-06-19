@@ -1,50 +1,88 @@
-# Windows Data Deduplication Decommissioning Tool
+# win-dedup-remover.ps1
 
-PowerShell script designed to clean up D:\System Volume Information\Dedup and uninstall the Windows Data Deduplication (`FS-Data-Deduplication`) feature from a targeted storage volume.
+## Purpose
+`win-dedup-remover.ps1` runs a controlled Data Deduplication removal workflow for a target volume.
 
-Expanding deduplicated data back to its original footprint is a high-risk operational task. If structural queues jam or a volume runs out of space, it can result in catastrophic data data corruption or frozen volumes. This script mitigates those risks by introducing a rigid, multi-step safety pipeline that handles pre-cleanup, diagnostic health monitoring, storage boundary calculations, and post-removal reporting.
+It is designed to:
+- stop scheduled dedup tasks during execution,
+- run unoptimization in passes,
+- stop unoptimization if free space drops below a threshold,
+- run garbage collection to completion between unoptimization passes,         
+- run a final full garbage collection,
+- report before/after storage usage,
+- re-enable scheduled dedup tasks when finished.
 
----
+## File
+- `PowerShell/Disk/Unoptimize.ps1`
 
-## 🛠️ Features & Execution Pipeline
+## Requirements
+- Windows Server with Data Deduplication feature installed.
+- PowerShell 7.0+.
+- Elevated session (Run as Administrator).
+- Permissions to run dedup cmdlets and manage scheduled tasks/services.
 
-The script safely offloads and uninstalls deduplication by executing the following strict phase pipeline:
+The script also declares:
+- `#Requires -Version 7.0`
+- `#Requires -RunAsAdministrator`
 
-1. **Service & Task Isolation:** Disables scheduled Windows deduplication tasks and force-resets the `ddpsvc` service to clear out any frozen host tasks (`fsdmhost`).
-2. **Pre-Cleanup Queue Purge:** Runs a high-priority structural integrity `Scrubbing` job and an initial `GarbageCollection` pass to clear easily reclaimable chunks and optimize the database *before* expansion.
-3. **Hardware & Capacity Guardrails:** * Queries storage reliability counters for active disk read/write errors.
-    * Enforces a **50% free space safety threshold check** to prevent catastrophic out-of-space lockups during re-inflation.
-4. **Unoptimization Engine:** Runs a full volume `Unoptimization` job to expand files, executes a deep final garbage collection, and disables the deduplication volume configuration.
-5. **Role De-provisioning:** Completely uninstalls the `FS-Data-Deduplication` Windows Server role.
-6. **Delta Reporting:** Generates a definitive final storage footprint report comparing initial vs. final space.
-7. **Graceful Reboot:** Schedules a forced 5-minute system restart to cleanly flush the storage stack and finalize role removal.
+## Configuration
+Edit these values at the top of the script:
 
----
+- `$TARGET_DRIVE`
+  - Drive letter only (for example: `D`)
+- `$LOOP_INTERVAL`
+  - Polling interval in seconds while watching dedup jobs
+- `$MIN_FREE_SPACE_GB`
+  - Unoptimization is stopped when free space is below this value
+- `$LOW_SPACE_COOLDOWN_SECONDS`
+  - Delay applied only when unoptimization was stopped due to low free space
+- `$ENABLE_LOGGING`
+  - Enables/disables file logging
+- `$LOG_FILE_PATH`
+  - Output log file path
 
-## ⚙️ Configuration
+## What The Script Does
+1. Disables scheduled deduplication tasks.
+2. Resets dedup service state.
+3. Enables dedup for the target volume (`Backup` usage type).
+4. Runs initial garbage collection.
+5. Disables dedup before entering the unoptimization loop.
+6. Loop:
+   - disables dedup,
+   - starts unoptimization,
+   - stops unoptimization if free space drops below `$MIN_FREE_SPACE_GB`,
+   - optional cooldown,
+   - enables dedup,
+   - runs garbage collection to completion,
+   - checks dedup status and repeats until unoptimization is complete.
+7. Enables dedup and runs final full garbage collection.
+8. Stops any remaining dedup job handles.
+9. Disables dedup volume.
+10. Prints final storage footprint report.
+11. Re-enables scheduled deduplication tasks.
 
-Before executing, open the script and adjust the configuration constants at the top of the file to fit your environment:
+## Completion Logic
+Unoptimization completion is determined by `Get-DedupStatus`:
+- `OptimizedFilesCount <= 0` means no optimized files remain.
 
-| Constant | Default Value | Description |
-| :--- | :--- | :--- |
-| `$TARGET_DRIVE` | `"D"` | Target drive letter (do **not** include a colon). |
-| `$LOOP_INTERVAL` | `300` | Loop wait time in seconds (5 minutes) used to poll active job statuses. |
-| `$ENABLE_LOGGING`| `$true` | Set to `$true` to output a persistent log file; `$false` to skip. |
-| `$LOG_FILE_PATH` | `"C:\DedupRemovalLog.txt"` | Full destination path for the timestamped execution log. |
-| `$FORCE_UNOPT` | `$false` | Set to `$true` to bypass the 50% free space safety warning. |
+## Run
+From an elevated PowerShell session:
 
----
+```powershell
+Set-Location "C:\Users\jmfmuch\source\repos\EUP\PowerShell\Disk"
+.\Unoptimize.ps1
+```
 
-## 🚀 Usage Instructions
+## Output
+- Console progress messages.
+- Optional log file entries at `$LOG_FILE_PATH`.
+- Final report values:
+  - initial free/used TB,
+  - final free/used TB,
+  - net reclaimed (or increased) footprint.
 
-### Prerequisites
-* **Windows Server** with an active Data Deduplication volume.
-* **Administrator Privileges:** PowerShell must be opened via "Run as Administrator".
-
-### Execution
-1. Download or clone this repository.
-2. Configure your `$TARGET_DRIVE` and preferences at the top of the script.
-3. Open an elevated PowerShell terminal and execute the script:
-   ```powershell
-   Set-ExecutionPolicy Bypass -Scope Process -Force
-   .\Unoptimize-DedupVolume.ps1
+## Notes
+- The script intentionally toggles dedup state:
+  - dedup is disabled before each unoptimization run,
+  - dedup is enabled before each garbage collection run.
+- If no dedup status is returned for the volume, the script treats unoptimization as complete.
