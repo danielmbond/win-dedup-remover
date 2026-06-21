@@ -207,7 +207,7 @@ function Get-UnoptimizationComplete {
 # ==============================================================================
 
 if ($ENABLE_LOGGING) {
-    "--- DEDUP REMOVAL EXECUTION STARTED ---" | Out-File -FilePath $LOG_FILE_PATH -Create -Encoding utf8
+    "--- DEDUP REMOVAL EXECUTION STARTED ---" | Out-File -FilePath $LOG_FILE_PATH -Force -Encoding utf8
     Write-LogMessage -Message "Logging enabled. Outputting to: $LOG_FILE_PATH" -Color Gray
 }
 
