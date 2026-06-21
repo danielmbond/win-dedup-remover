@@ -278,7 +278,7 @@ do {
 
 Write-LogMessage -Message "Step 7: Running final full Garbage Collection..." -Color Yellow
 Enable-DedupVolume -Volume $DriveVolume -UsageType Backup
-Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Full -Priority High -Memory 75
+Start-DedupJob -Volume $DriveVolume -Type GarbageCollection -Priority High -Memory 75 -Full
 Watch-DedupJob -JobPrefix "GarbageCollection (Full Final)" -Volume $DriveVolume -DriveId $LogicalDiskId -IntervalSeconds $LOOP_INTERVAL
 
 Write-LogMessage -Message "Step 8: Stopping any remaining dedup job handles..." -Color Yellow
